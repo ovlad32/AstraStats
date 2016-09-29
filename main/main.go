@@ -8,18 +8,27 @@ import (
 	"fmt"
 	_ "github.com/lib/pq"
 	"io"
-	"log"
 	"math"
 	"os"
 	"strconv"
 	"strings"
-	"runtime"
-	"time"
+	"io/ioutil"
+	"path"
+	"path/filepath"
+	"log"
+	"sort"
 )
 
 type ConfigType struct {
-	LineSeparator  int `json:"lineSeparatorByte"`
-	FieldSeparator int `json:"fieldSeparatorByte"`
+	AppMode        string
+	DumpRootPath   string `json:"dumpRootPath"`
+	LineSeparator  int    `json:"lineSeparatorByte"`
+	FieldSeparator int    `json:"fieldSeparatorByte"`
+	H2Host         string `json:"h2-host"`
+	H2Port         string `json:"h2-port"`
+	H2Name         string `json:"h2-dbname"`
+	H2Login        string `json:"h2-login"`
+	H2Password     string `json:"h2-password"`
 }
 
 var (
@@ -63,7 +72,7 @@ type TableInfoType struct {
 	Id            sql.NullInt64
 	DatabaseName  sql.NullString
 	SchemaName    sql.NullString
-	Name          sql.NullString
+	TableName     sql.NullString
 	RowCount      sql.NullInt64
 	Dumped        sql.NullString
 	Indexed       sql.NullString
@@ -73,7 +82,7 @@ type TableInfoType struct {
 }
 type ColumnInfoType struct {
 	Id              sql.NullInt64
-	Name            sql.NullString
+	ColumnName      sql.NullString
 	DataLength      sql.NullInt64
 	DataPrecision   sql.NullInt64
 	DataScale       sql.NullInt64
@@ -96,12 +105,36 @@ type ColumnInfoType struct {
 	// -------------------
 }
 
-func DbInit(dbname string) {
+func(c ColumnInfoType) h2ColumnTableName() string {
+	return fmt.Sprintf("%v_$%v",
+		c.TableInfo.TableName.String,
+		c.ColumnName.String,
+	)
+}
+
+func (c ColumnInfoType) pathToNumericDump(conf *ConfigType) (string) {
+	return conf.DumpRootPath + "/" +
+		c.TableInfo.PathToDataDir.String + "/" +
+		"NUMERIC_DATA/" +
+		c.TableInfo.TableName.String + "/" +
+		c.ColumnName.String + "/"
+}
+
+func DbInit() {
 	var err error
 	//pwd for sbs:123123
-	Db, err = sql.Open("postgres", "user=edm password=edmedm dbname="+dbname+" host=localhost port=5435 sslmode=disable")
+	params := fmt.Sprintf("host=%v port=%v dbname=%v user=%v password=%v sslmode=disable",
+		Conf.H2Host,
+		Conf.H2Port,
+		Conf.H2Name,
+		Conf.H2Login,
+		Conf.H2Password,
+	)
+	//fmt.Println(params)
+	Db, err = sql.Open("postgres", params)
+
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 }
 
@@ -117,17 +150,18 @@ func varInit() {
 	if err != nil {
 		panic(err)
 	}
-	//fmt.Println(Conf)
+	if Conf.DumpRootPath == "" {
+		Conf.DumpRootPath = "."
+	}
+//	fmt.Println(Conf)
 }
 func main() {
-	now := time.Now()
 	var id int64
-	runtime.GOMAXPROCS(4)
 	if len(os.Args) < 3 {
-		panic("AstraTableStats dbName #table_id!")
+		panic("AstraTableStats mode #table_id!")
 	}
 	//fmt.Println(os.Args,len(os.Args))
-	dbName := os.Args[1]
+	mode := os.Args[1]
 
 	id, err := strconv.ParseInt(os.Args[2], 10, 64)
 	if err != nil {
@@ -135,7 +169,9 @@ func main() {
 	}
 
 	varInit()
-	DbInit(dbName)
+	DbInit()
+
+	Conf.AppMode = mode
 
 	_, err = Db.Exec("create table if not exists column_stats(id bigint not null,imin bigint,imax bigint,fmax float,fmin float, constraint column_stats_pk primary key (id))")
 
@@ -155,21 +191,33 @@ func main() {
 	}
 
 	var ti TableInfoType
-
 	start := NewMessageChannel()
-	tableInfoC1 := NewMessageChannel()
 	finish := NewMessageChannel()
-	statsChan := NewMessageChannelSize(1000)
-	saveChan := NewMessageChannelSize(1000)
-	fileChan := NewMessageChannelSize(1000)
-	//doneChan2 := NewMessageChannelSize(1000)
-	go CreateColumnTable(start, tableInfoC1)
-	go PipeTableData(tableInfoC1, statsChan)
-	go CollectStats(statsChan, saveChan)
-	go SaveData(saveChan, fileChan)
-	go Terminator(fileChan, finish)
-	//go LoadH2(fileChan, doneChan2)
-	//go Terminator(doneChan2, finish)
+
+	switch strings.ToUpper(Conf.AppMode) {
+	case strings.ToUpper("NumericExtract"):
+		{
+			saveChan := NewMessageChannelSize(1000)
+			statsChan := NewMessageChannelSize(1000)
+			fileChan := NewMessageChannelSize(1000)
+			doneChan2 := NewMessageChannelSize(1000)
+			go PipeTableData(start, statsChan)
+			go CollectMinMaxStats(statsChan, saveChan)
+			go SaveData(saveChan, fileChan)
+			//go LoadH2(fileChan, doneChan2)
+			go Terminator(doneChan2, finish)
+		}
+	case strings.ToUpper("Consolidation"):
+		{
+			statsChan := NewMessageChannelSize(1000)
+			doneChan2 := NewMessageChannelSize(1000)
+			go PipeDumpFileNames(start, statsChan)
+			go FIConsolidation(statsChan,doneChan2)
+			go Terminator(doneChan2, finish)
+
+		}
+
+	}
 
 	if !tiRws.Next() {
 		panic(fmt.Sprintf("There is no table having id = %v", id))
@@ -178,7 +226,7 @@ func main() {
 			&ti.Id,
 			&ti.DatabaseName,
 			&ti.SchemaName,
-			&ti.Name,
+			&ti.TableName,
 			&ti.RowCount,
 			&ti.Dumped,
 			&ti.PathToFile,
@@ -199,19 +247,16 @@ func main() {
 				" ,TOTAL_ROW_COUNT"+
 				" ,UNIQUE_ROW_COUNT"+
 				" ,HASH_UNIQUE_COUNT"+
-				" from column_info c " +
-				" where c.TABLE_INFO_ID = %v " +
-				" order by c.POSITION asc", id))
+				" from column_info c where c.TABLE_INFO_ID = %v order by c.POSITION asc", id))
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println(ti.Name.String)
 
 		for ciRws.Next() {
 			var ci ColumnInfoType
 			ciRws.Scan(
 				&ci.Id,
-				&ci.Name,
+				&ci.ColumnName,
 				&ci.DataType,
 				&ci.RealType,
 				&ci.DataLength,
@@ -235,13 +280,13 @@ func main() {
 		start <- NewMessage().Add("table", ti)
 
 	}
-
+	close(start)
 	<-finish
 
 	for index := range ti.Columns {
 		c := ti.Columns[index]
 		if c.IsNumeric {
-			fmt.Print(c.Name.String)
+			fmt.Print(c.ColumnName.String)
 			Db.Exec(fmt.Sprintf("delete from column_stats where id=%v", c.Id.Int64))
 
 			if c.IsInteger {
@@ -256,22 +301,17 @@ func main() {
 	}
 
 	Db.Close()
-	fmt.Println("Took ",time.Since(now))
 
 }
-func ColumnTableName(column *ColumnInfoType) string {
-	return fmt.Sprintf("%v_$%v",
-		column.TableInfo.Name.String,
-		column.Name.String,
-	)
-}
+
+
 func CreateColumnTable(in MessageChannel, out MessageChannel) {
 	for msg := range in {
 		if raw, found := (*msg)["table"]; found {
 
 			ti := raw.(TableInfoType)
 			for _, column := range ti.Columns {
-				tableName := ColumnTableName(&column)
+				tableName := column.h2ColumnTableName()
 
 				tx, err := Db.Begin()
 				if err != nil {
@@ -303,7 +343,7 @@ func CreateColumnTable(in MessageChannel, out MessageChannel) {
 func PipeTableData(in MessageChannel, out MessageChannel) {
 	for msg := range in {
 		ti := (*msg)["table"].(TableInfoType)
-		gzfile, err := os.Open(ti.PathToFile.String)
+		gzfile, err := os.Open(Conf.DumpRootPath + ti.PathToFile.String)
 		if err != nil {
 			panic(err)
 		}
@@ -316,7 +356,7 @@ func PipeTableData(in MessageChannel, out MessageChannel) {
 		}
 		defer file.Close()
 
-		rawData := bufio.NewReaderSize(file, 50*1024)
+		rawData := bufio.NewReaderSize(file, 5*1024)
 
 		sLineSeparator := string(Conf.LineSeparator)
 		sFieldSeparator := string(Conf.FieldSeparator)
@@ -367,7 +407,7 @@ func PipeTableData(in MessageChannel, out MessageChannel) {
 
 }
 
-func CollectStats(in MessageChannel, out MessageChannel) {
+func CollectMinMaxStats(in MessageChannel, out MessageChannel) {
 	for msg := range in {
 		if _, found := (*msg)["table"]; found {
 			out <- msg
@@ -431,19 +471,16 @@ func CollectStats(in MessageChannel, out MessageChannel) {
 }
 
 func SaveData(in MessageChannel, out MessageChannel) {
-	zip := true
+	zip := false
 
 	type Writer interface {
 		Write(a []byte) (int, error)
-	}
-	type Closer interface {
 		Close() error
 	}
 
 	type Dump struct {
 		pathToFile string
 		writer     Writer
-		closer     Closer
 		column     *ColumnInfoType
 	}
 	type Dumpers map[string]Dump
@@ -451,7 +488,7 @@ func SaveData(in MessageChannel, out MessageChannel) {
 
 	PushDumperInfoToOutChannel := func() {
 		for _, v := range dumpers {
-			v.closer.Close()
+			v.writer.Close()
 			//fmt.Println(v.column.Name, v.pathToFile)
 			out <- NewMessage().
 				Add("column", v.column).
@@ -469,19 +506,18 @@ func SaveData(in MessageChannel, out MessageChannel) {
 		} else if raw, found := (*msg)["data"]; found {
 			data := raw.(ColumnDataImage)
 
-			path := data.ColumnInfo.TableInfo.PathToDataDir.String +
-				"/NUMERIC_DATA/" + data.ColumnInfo.TableInfo.Name.String + "/" +
-				data.ColumnInfo.Name.String
-			if data.ColumnInfo.IsInteger {
-				path += "/I/"
-			} else {
-				path += "/F/"
-			}
-			name := fmt.Sprintf("%v", len(data.Image))
+			pathToDump := data.ColumnInfo.pathToNumericDump(&Conf)
 
-			fullFileName := path + name
+			if data.ColumnInfo.IsInteger {
+				pathToDump += "/I/"
+			} else {
+				pathToDump += "/F/"
+			}
+			name := fmt.Sprintf("%v.raw.gz", len(data.Image))
+
+			fullFileName := pathToDump + name
 			if dumper, found := dumpers[fullFileName]; !found {
-				err := os.MkdirAll(path, 0)
+				err := os.MkdirAll(pathToDump, 0)
 				if err != nil {
 					panic(err)
 				}
@@ -493,17 +529,12 @@ func SaveData(in MessageChannel, out MessageChannel) {
 				dumper.column = data.ColumnInfo
 				dumper.pathToFile = fullFileName
 				if zip {
-					gzipFile, err := gzip.NewWriterLevel(file, gzip.BestSpeed)
+					dumper.writer, err = gzip.NewWriterLevel(file, gzip.BestSpeed)
 					if err != nil {
 						panic(err)
 					}
-					//dumper.writer = bufio.NewWriterSize(gzipFile,4*32*1024)
-					dumper.writer = gzipFile
-					dumper.closer = gzipFile
-
 				} else {
-					dumper.closer = file
-					dumper.writer = bufio.NewWriterSize(file,50*1024)
+					dumper.writer = file
 				}
 				dumpers[fullFileName] = dumper
 
@@ -518,25 +549,32 @@ func SaveData(in MessageChannel, out MessageChannel) {
 	}
 	close(out)
 }
+
+
+
+
 func LoadH2(in MessageChannel, out MessageChannel) {
 	curDir, _ := os.Getwd()
 	for msg := range in {
 		if rawPath, found := (*msg)["path"]; found {
-			path := rawPath.(string)
+			pathTo := rawPath.(string)
 			column := (*msg)["column"].(*ColumnInfoType)
 
-			tableName := fmt.Sprintf("%v_$%v",
-				column.TableInfo.Name.String,
-				column.Name.String,
-			)
+			tableName := column.h2ColumnTableName()
 
 			{
 				tx, err := Db.Begin()
 				if err != nil {
 					panic(err)
 				}
+				pathTo := Conf.DumpRootPath+"/"+pathTo;
+
+				if !path.IsAbs(pathTo) {
+					pathTo = curDir + pathTo
+				}
+
 				sql := fmt.Sprintf("insert into %v select COL,count(1) as CNT from csvRead('%v','COL') group by COL",
-					tableName, curDir+"/"+path)
+					tableName, pathTo)
 				//fmt.Println(sql)
 
 				_, err = tx.Exec(sql)
@@ -554,6 +592,195 @@ func LoadH2(in MessageChannel, out MessageChannel) {
 	}
 	close(out)
 }
+func PipeDumpFileNames(in MessageChannel, out MessageChannel) {
+
+	for msg := range in {
+		sent := make(map[string]bool)
+
+		ti := (*msg)["table"].(TableInfoType)
+		out <- msg
+		for _,column := range ti.Columns {
+			path := column.pathToNumericDump(&Conf)
+			pathF := path+"F/"
+			pathI := path+"I/"
+
+			contentsI,err := ioutil.ReadDir(pathI)
+			if err != nil {
+				continue
+			}
+			for _, f := range contentsI {
+				if !f.IsDir() {
+					if _, err := os.Stat(pathF+f.Name()); os.IsNotExist(err) {
+						out <- NewMessage().Add("I", pathI+f.Name())
+						//fmt.Println(pathI+f.Name())
+					}else{
+						out<-NewMessage().Add("NI",pathI+f.Name())
+						out<-NewMessage().Add("NF",pathF+f.Name())
+						//fmt.Println(pathF+f.Name())
+						//fmt.Println(pathI+f.Name())
+						sent[f.Name()]=true
+					}
+				}
+			}
+			contentsF,err := ioutil.ReadDir(pathF)
+			if err != nil {
+				continue
+			}
+			for _, f := range contentsF {
+				if !f.IsDir() {
+					if _, found := sent[f.Name()]; !found {
+						out <- NewMessage().Add("F", pathF+f.Name())
+						fmt.Println(pathF+f.Name())
+
+					}
+				}
+			}
+		}
+	}
+	close(out)
+}
+
+type kvType struct {
+	key string
+	value string
+}
+type kvArrayType []kvType;
+func(k kvArrayType) Len() int {return len(k)}
+func (k kvArrayType) Less(i, j int) bool {
+	ki,_ := strconv.ParseFloat(k[i].key,64);
+	kj,_ := strconv.ParseFloat(k[j].key,64);
+	return ki < kj
+}
+func (k kvArrayType) Swap(i, j int)      { k[i], k[j] = k[j], k[i] }
+
+func FIConsolidation(in MessageChannel, out MessageChannel) {
+	pipe := func(fileNames ...string) {
+		type storageType map[string]uint64
+		type storageArrayType []storageType
+
+		const maxLength = 100
+		PositiveIntegerStorages := make(storageArrayType,maxLength)
+		NegativeIntegerStorages := make(storageArrayType,maxLength)
+		PositiveFloatStorages := make(storageArrayType,maxLength)
+		NegativeFloatStorages := make(storageArrayType,maxLength)
+
+		var storages *storageArrayType;
+		var pathToFile string
+		for _,fullFileName := range fileNames {
+			if fullFileName == "" {
+				continue
+			}
+			fileName := filepath.Base(fullFileName)
+			pathToFile = filepath.Dir(fullFileName)
+			pathToFile = strings.TrimSuffix(pathToFile,string(os.PathSeparator))
+			pathToFile = filepath.Dir(pathToFile)
+			dataLength, err := strconv.ParseInt(fileName, 10, 64)
+			if err != nil {
+				log.Println(fullFileName, " skipped")
+				continue
+			}
+			zFile,err := os.Open(fullFileName)
+			if err != nil {
+				panic(err)
+			}
+
+			defer zFile.Close()
+			dump,err := gzip.NewReader(zFile)
+			if err != nil {
+				panic(err)
+			}
+			data := bufio.NewScanner(dump)
+			for data.Scan() {
+				sval := data.Text()
+				if strings.Contains(sval,".") {
+					if strings.HasPrefix(sval,"-") {
+						storages = &NegativeFloatStorages
+					} else {
+						storages = &PositiveFloatStorages
+					}
+				} else {
+					if strings.HasPrefix(sval, "-") {
+						storages = &NegativeIntegerStorages
+					} else {
+						storages = &PositiveIntegerStorages
+					}
+				}
+				if (*storages)[dataLength] == nil {
+					(*storages)[dataLength] = make(storageType)
+				}
+				(*storages)[dataLength][sval] = (*storages)[dataLength][sval] + 1
+			}
+		}
+		sortAndSave := func(prefix string,storages *storageArrayType) {
+			fieldSeparator := make([]byte,1)
+			fieldSeparator[0] = byte(Conf.FieldSeparator)
+			lineSeparator := make([]byte,1)
+			lineSeparator[0] = byte(Conf.LineSeparator)
+
+			for index,storage := range *storages {
+				if storage != nil {
+					kv := make(kvArrayType,0,len(storage))
+					for k,v := range storage {
+						kv = append(kv,kvType{key:k,value:fmt.Sprintf("%v",v)})
+					}
+					sort.Sort(kv)
+					newPath := pathToFile + "/" + prefix
+					os.Mkdir(newPath,0)
+					newFileName := fmt.Sprintf("%v/%v",newPath,index)
+					file,err := os.Create(newFileName)
+					if err != nil {
+						panic(err)
+					}
+					fmt.Println(newFileName)
+					defer file.Close()
+					zFile,err := gzip.NewWriterLevel(file,gzip.BestSpeed)
+					if err != nil {
+						panic(err)
+					}
+					defer zFile.Close()
+
+					for _,data := range kv {
+						zFile.Write([]byte(data.key))
+						zFile.Write(fieldSeparator)
+						zFile.Write([]byte(string(data.value)))
+						zFile.Write(lineSeparator)
+						//TODO:here must be calculation of if the dataset is a sequence
+					}
+
+
+				}
+			}
+		}
+		sortAndSave("PI",&PositiveIntegerStorages)
+		sortAndSave("NI",&NegativeIntegerStorages)
+		sortAndSave("PF",&PositiveFloatStorages)
+		sortAndSave("NF",&NegativeFloatStorages)
+	}
+		var dumpFileNameNI string
+                for msg := range in {
+		       if raw, found := (*msg)["I"]; found {
+			       dumpFileName := raw.(string)
+			       pipe(dumpFileName)
+		       }
+			if raw, found := (*msg)["F"]; found {
+				dumpFileName := raw.(string)
+				pipe(dumpFileName)
+			}
+
+			if raw, found := (*msg)["NI"]; found {
+				dumpFileNameNI = raw.(string)
+				dumpFileName := raw.(string)
+				pipe(dumpFileName)
+			}
+			if raw, found := (*msg)["NF"]; found {
+				dumpFileName := raw.(string)
+				pipe(dumpFileNameNI,dumpFileName)
+				dumpFileNameNI = ""
+			}
+			out <-msg
+                }
+	close(out)
+}
 
 func Terminator(in MessageChannel, out MessageChannel) {
 	for _ = range in {
@@ -564,3 +791,17 @@ func Terminator(in MessageChannel, out MessageChannel) {
 //
 // htps://godoc.org/github.com/cznic/lldb
 // https://www.reddit.com/r/golang/comments/3m1xcu/embeddable_database_for_go/
+/*
+
+{
+  "dumpRootPath": "",
+  "lineSeparatorByte": 10,
+  "fieldSeparatorByte": 124,
+  "h2-host": "localhost",
+  "h2-port": "5435",
+  "h2-dbname":"edm",
+  "h2-login": "edm",
+  "h2-password":"edmedm"
+}v
+
+*/

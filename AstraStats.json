@@ -1,5 +1,11 @@
 {
+	"dumpRootPath": "",
 	"lineSeparatorByte": 10,
-	"fieldSeparatorByte": 124
+	"fieldSeparatorByte": 124,
+	"h2-host": "localhost",
+	"h2-port": "5435",
+	"h2-dbname":"edm",
+	"h2-login": "edm",
+	"h2-password":"edmedm"
 }
  
