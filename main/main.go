@@ -7,16 +7,17 @@ import (
 	"encoding/json"
 	"fmt"
 	_ "github.com/lib/pq"
+	"github.com/montanaflynn/stats"
 	"io"
+	"io/ioutil"
+	"log"
 	"math"
 	"os"
-	"strconv"
-	"strings"
-	"io/ioutil"
 	"path"
 	"path/filepath"
-	"log"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 type ConfigType struct {
@@ -105,14 +106,14 @@ type ColumnInfoType struct {
 	// -------------------
 }
 
-func(c ColumnInfoType) h2ColumnTableName() string {
+func (c ColumnInfoType) h2ColumnTableName() string {
 	return fmt.Sprintf("%v_$%v",
 		c.TableInfo.TableName.String,
 		c.ColumnName.String,
 	)
 }
 
-func (c ColumnInfoType) pathToNumericDump(conf *ConfigType) (string) {
+func (c ColumnInfoType) pathToNumericDump(conf *ConfigType) string {
 	return conf.DumpRootPath + "/" +
 		c.TableInfo.PathToDataDir.String + "/" +
 		"NUMERIC_DATA/" +
@@ -151,9 +152,9 @@ func varInit() {
 		panic(err)
 	}
 	if Conf.DumpRootPath == "" {
-		Conf.DumpRootPath = "."
+		Conf.DumpRootPath = "./"
 	}
-//	fmt.Println(Conf)
+	//	fmt.Println(Conf)
 }
 func main() {
 	var id int64
@@ -174,6 +175,17 @@ func main() {
 	Conf.AppMode = mode
 
 	_, err = Db.Exec("create table if not exists column_stats(id bigint not null,imin bigint,imax bigint,fmax float,fmin float, constraint column_stats_pk primary key (id))")
+	_, err = Db.Exec("create table if not exists column_segment_stats(" +
+		" id bigint not null," +
+		" prefix varchar(100) not null, " +
+		" segment bigint not null, " +
+		" dumpfile varchar(100), " +
+		" fmin float, " +
+		" fmax float, " +
+		" uniq_count bigint, " +
+		" delta_mean float , " +
+		" delta_stdv float, " +
+		" constraint column_dump_stats_pk primary key (id, segment, prefix) )")
 
 	tiRws, err := Db.Query(fmt.Sprintf(
 		"select "+
@@ -200,23 +212,24 @@ func main() {
 			saveChan := NewMessageChannelSize(1000)
 			statsChan := NewMessageChannelSize(1000)
 			fileChan := NewMessageChannelSize(1000)
-			doneChan2 := NewMessageChannelSize(1000)
+			//			doneChan2 := NewMessageChannelSize(1000)
 			go PipeTableData(start, statsChan)
 			go CollectMinMaxStats(statsChan, saveChan)
 			go SaveData(saveChan, fileChan)
 			//go LoadH2(fileChan, doneChan2)
-			go Terminator(doneChan2, finish)
+			go Terminator(fileChan, finish)
 		}
 	case strings.ToUpper("Consolidation"):
 		{
 			statsChan := NewMessageChannelSize(1000)
 			doneChan2 := NewMessageChannelSize(1000)
 			go PipeDumpFileNames(start, statsChan)
-			go FIConsolidation(statsChan,doneChan2)
+			go FIConsolidation(statsChan, doneChan2)
 			go Terminator(doneChan2, finish)
 
 		}
-
+	default:
+		panic(fmt.Sprintf("%v is unknown mode"))
 	}
 
 	if !tiRws.Next() {
@@ -303,7 +316,6 @@ func main() {
 	Db.Close()
 
 }
-
 
 func CreateColumnTable(in MessageChannel, out MessageChannel) {
 	for msg := range in {
@@ -471,7 +483,7 @@ func CollectMinMaxStats(in MessageChannel, out MessageChannel) {
 }
 
 func SaveData(in MessageChannel, out MessageChannel) {
-	zip := false
+	zip := true
 
 	type Writer interface {
 		Write(a []byte) (int, error)
@@ -513,7 +525,7 @@ func SaveData(in MessageChannel, out MessageChannel) {
 			} else {
 				pathToDump += "/F/"
 			}
-			name := fmt.Sprintf("%v.raw.gz", len(data.Image))
+			name := fmt.Sprintf("%v", len(data.Image))
 
 			fullFileName := pathToDump + name
 			if dumper, found := dumpers[fullFileName]; !found {
@@ -550,9 +562,6 @@ func SaveData(in MessageChannel, out MessageChannel) {
 	close(out)
 }
 
-
-
-
 func LoadH2(in MessageChannel, out MessageChannel) {
 	curDir, _ := os.Getwd()
 	for msg := range in {
@@ -567,7 +576,7 @@ func LoadH2(in MessageChannel, out MessageChannel) {
 				if err != nil {
 					panic(err)
 				}
-				pathTo := Conf.DumpRootPath+"/"+pathTo;
+				pathTo := Conf.DumpRootPath + "/" + pathTo
 
 				if !path.IsAbs(pathTo) {
 					pathTo = curDir + pathTo
@@ -599,30 +608,31 @@ func PipeDumpFileNames(in MessageChannel, out MessageChannel) {
 
 		ti := (*msg)["table"].(TableInfoType)
 		out <- msg
-		for _,column := range ti.Columns {
+		for _, column := range ti.Columns {
+			out <- NewMessage().Add("column", column)
 			path := column.pathToNumericDump(&Conf)
-			pathF := path+"F/"
-			pathI := path+"I/"
+			pathF := path + "F/"
+			pathI := path + "I/"
 
-			contentsI,err := ioutil.ReadDir(pathI)
+			contentsI, err := ioutil.ReadDir(pathI)
 			if err != nil {
 				continue
 			}
 			for _, f := range contentsI {
 				if !f.IsDir() {
-					if _, err := os.Stat(pathF+f.Name()); os.IsNotExist(err) {
+					if _, err := os.Stat(pathF + f.Name()); os.IsNotExist(err) {
 						out <- NewMessage().Add("I", pathI+f.Name())
 						//fmt.Println(pathI+f.Name())
-					}else{
-						out<-NewMessage().Add("NI",pathI+f.Name())
-						out<-NewMessage().Add("NF",pathF+f.Name())
+					} else {
+						out <- NewMessage().Add("NI", pathI+f.Name())
+						out <- NewMessage().Add("NF", pathF+f.Name())
 						//fmt.Println(pathF+f.Name())
 						//fmt.Println(pathI+f.Name())
-						sent[f.Name()]=true
+						sent[f.Name()] = true
 					}
 				}
 			}
-			contentsF,err := ioutil.ReadDir(pathF)
+			contentsF, err := ioutil.ReadDir(pathF)
 			if err != nil {
 				continue
 			}
@@ -630,7 +640,7 @@ func PipeDumpFileNames(in MessageChannel, out MessageChannel) {
 				if !f.IsDir() {
 					if _, found := sent[f.Name()]; !found {
 						out <- NewMessage().Add("F", pathF+f.Name())
-						fmt.Println(pathF+f.Name())
+						fmt.Println(pathF + f.Name())
 
 					}
 				}
@@ -641,59 +651,72 @@ func PipeDumpFileNames(in MessageChannel, out MessageChannel) {
 }
 
 type kvType struct {
-	key string
+	key   string
 	value string
 }
-type kvArrayType []kvType;
-func(k kvArrayType) Len() int {return len(k)}
+type kvArrayType []kvType
+
+func (k kvArrayType) Len() int { return len(k) }
 func (k kvArrayType) Less(i, j int) bool {
-	ki,_ := strconv.ParseFloat(k[i].key,64);
-	kj,_ := strconv.ParseFloat(k[j].key,64);
+	ki, _ := strconv.ParseFloat(k[i].key, 64)
+	kj, _ := strconv.ParseFloat(k[j].key, 64)
 	return ki < kj
 }
-func (k kvArrayType) Swap(i, j int)      { k[i], k[j] = k[j], k[i] }
+func (k kvArrayType) Swap(i, j int) { k[i], k[j] = k[j], k[i] }
+
+type dumpStatsType struct {
+	dumpfile  string
+	fmin      float64
+	fmax      float64
+	uniqCount int
+	deltaMean float64
+	deltaStdv float64
+}
 
 func FIConsolidation(in MessageChannel, out MessageChannel) {
+	var column ColumnInfoType
+	var dumpFileNameNI string
+
 	pipe := func(fileNames ...string) {
 		type storageType map[string]uint64
 		type storageArrayType []storageType
 
 		const maxLength = 100
-		PositiveIntegerStorages := make(storageArrayType,maxLength)
-		NegativeIntegerStorages := make(storageArrayType,maxLength)
-		PositiveFloatStorages := make(storageArrayType,maxLength)
-		NegativeFloatStorages := make(storageArrayType,maxLength)
+		PositiveIntegerStorages := make(storageArrayType, maxLength)
+		NegativeIntegerStorages := make(storageArrayType, maxLength)
+		PositiveFloatStorages := make(storageArrayType, maxLength)
+		NegativeFloatStorages := make(storageArrayType, maxLength)
 
-		var storages *storageArrayType;
+		var storages *storageArrayType
 		var pathToFile string
-		for _,fullFileName := range fileNames {
+		for _, fullFileName := range fileNames {
 			if fullFileName == "" {
 				continue
 			}
 			fileName := filepath.Base(fullFileName)
 			pathToFile = filepath.Dir(fullFileName)
-			pathToFile = strings.TrimSuffix(pathToFile,string(os.PathSeparator))
+			pathToFile = strings.TrimSuffix(pathToFile, string(os.PathSeparator))
 			pathToFile = filepath.Dir(pathToFile)
 			dataLength, err := strconv.ParseInt(fileName, 10, 64)
 			if err != nil {
 				log.Println(fullFileName, " skipped")
 				continue
 			}
-			zFile,err := os.Open(fullFileName)
+			zFile, err := os.Open(fullFileName)
 			if err != nil {
 				panic(err)
 			}
 
 			defer zFile.Close()
-			dump,err := gzip.NewReader(zFile)
+			dump, err := gzip.NewReader(zFile)
 			if err != nil {
 				panic(err)
 			}
 			data := bufio.NewScanner(dump)
 			for data.Scan() {
 				sval := data.Text()
-				if strings.Contains(sval,".") {
-					if strings.HasPrefix(sval,"-") {
+				if strings.Contains(sval, ".") {
+					if strings.HasPrefix(sval, "-") {
 						storages = &NegativeFloatStorages
 					} else {
 						storages = &PositiveFloatStorages
@@ -711,74 +734,124 @@ func FIConsolidation(in MessageChannel, out MessageChannel) {
 				(*storages)[dataLength][sval] = (*storages)[dataLength][sval] + 1
 			}
 		}
-		sortAndSave := func(prefix string,storages *storageArrayType) {
-			fieldSeparator := make([]byte,1)
+		sortAndSave := func(prefix string, storages *storageArrayType) {
+			fieldSeparator := make([]byte, 1)
 			fieldSeparator[0] = byte(Conf.FieldSeparator)
-			lineSeparator := make([]byte,1)
+			lineSeparator := make([]byte, 1)
 			lineSeparator[0] = byte(Conf.LineSeparator)
 
-			for index,storage := range *storages {
+			for index, storage := range *storages {
 				if storage != nil {
-					kv := make(kvArrayType,0,len(storage))
-					for k,v := range storage {
-						kv = append(kv,kvType{key:k,value:fmt.Sprintf("%v",v)})
+					kv := make(kvArrayType, 0, len(storage))
+					deltaArray := make([]float64, 0, len(storage))
+					for k, v := range storage {
+						kv = append(kv, kvType{key: k, value: fmt.Sprintf("%v", v)})
 					}
 					sort.Sort(kv)
 					newPath := pathToFile + "/" + prefix
-					os.Mkdir(newPath,0)
-					newFileName := fmt.Sprintf("%v/%v",newPath,index)
-					file,err := os.Create(newFileName)
+					os.Mkdir(newPath, 0)
+					newFileName := fmt.Sprintf("%v/%v", newPath, index)
+					file, err := os.Create(newFileName)
 					if err != nil {
 						panic(err)
 					}
-					fmt.Println(newFileName)
+					//fmt.Println(newFileName)
 					defer file.Close()
-					zFile,err := gzip.NewWriterLevel(file,gzip.BestSpeed)
+					zFile, err := gzip.NewWriterLevel(file, gzip.BestSpeed)
 					if err != nil {
 						panic(err)
 					}
 					defer zFile.Close()
+					var prev float64
+					var total float64 = 0
+					dumpStats := dumpStatsType{
+						dumpfile:  newFileName,
+						uniqCount: len(kv),
+						fmin:      math.MaxFloat64,
+						fmax:      -math.MaxFloat64,
+					}
 
-					for _,data := range kv {
+					for index, data := range kv {
+						fval, _ := strconv.ParseFloat(data.key, 64)
+						if index != 0 {
+							deltaArray = append(deltaArray, prev-fval)
+						}
 						zFile.Write([]byte(data.key))
 						zFile.Write(fieldSeparator)
 						zFile.Write([]byte(string(data.value)))
 						zFile.Write(lineSeparator)
-						//TODO:here must be calculation of if the dataset is a sequence
+						prev = fval
+						total = total + fval
+						if fval < dumpStats.fmin {
+							dumpStats.fmin = fval
+						}
+						if fval > dumpStats.fmax {
+							dumpStats.fmax = fval
+						}
+
+
+					}
+					dumpStats.deltaMean = total / float64(len(deltaArray))
+					if len(deltaArray) >0 {
+						dumpStats.deltaStdv, err = stats.StandardDeviation(deltaArray)
+						if err != nil {
+							panic(err)
+						}
+					} else {
+						dumpStats.deltaStdv = -1
 					}
 
+					tx, err := Db.Begin()
+					sql := fmt.Sprintf("merge into column_segment_stats(id, dumpfile, prefix, segment, fmin, fmax, uniq_count, delta_mean, delta_stdv) key(id, prefix, segment) values "+
+						"(%v, '%v', '%v', %v, %f, %f, %v, %f, %f)",
+						column.Id.Int64,
+						dumpStats.dumpfile,
+						prefix,
+						index,
+						dumpStats.fmin,
+						dumpStats.fmax,
+						dumpStats.uniqCount,
+						dumpStats.deltaMean,
+						dumpStats.deltaStdv,
+					)
+					//fmt.Println(sql)
+					tx.Exec(sql)
+
+					tx.Commit();
 
 				}
 			}
 		}
-		sortAndSave("PI",&PositiveIntegerStorages)
-		sortAndSave("NI",&NegativeIntegerStorages)
-		sortAndSave("PF",&PositiveFloatStorages)
-		sortAndSave("NF",&NegativeFloatStorages)
+		sortAndSave("PI", &PositiveIntegerStorages)
+		sortAndSave("NI", &NegativeIntegerStorages)
+		sortAndSave("PF", &PositiveFloatStorages)
+		sortAndSave("NF", &NegativeFloatStorages)
 	}
-		var dumpFileNameNI string
-                for msg := range in {
-		       if raw, found := (*msg)["I"]; found {
-			       dumpFileName := raw.(string)
-			       pipe(dumpFileName)
-		       }
-			if raw, found := (*msg)["F"]; found {
-				dumpFileName := raw.(string)
-				pipe(dumpFileName)
-			}
+	for msg := range in {
+		if raw, found := (*msg)["I"]; found {
+			dumpFileName := raw.(string)
+			pipe(dumpFileName)
+		}
+		if raw, found := (*msg)["F"]; found {
+			dumpFileName := raw.(string)
+			pipe(dumpFileName)
+		}
 
-			if raw, found := (*msg)["NI"]; found {
-				dumpFileNameNI = raw.(string)
-				dumpFileName := raw.(string)
-				pipe(dumpFileName)
-			}
-			if raw, found := (*msg)["NF"]; found {
-				dumpFileName := raw.(string)
-				pipe(dumpFileNameNI,dumpFileName)
-				dumpFileNameNI = ""
-			}
-			out <-msg
-                }
+		if raw, found := (*msg)["NI"]; found {
+			dumpFileNameNI = raw.(string)
+			dumpFileName := raw.(string)
+			pipe(dumpFileName)
+		}
+		if raw, found := (*msg)["NF"]; found {
+			dumpFileName := raw.(string)
+			pipe(dumpFileNameNI, dumpFileName)
+			dumpFileNameNI = ""
+		}
+		if raw, found := (*msg)["column"]; found {
+			column = raw.(ColumnInfoType)
+		}
+		out <- msg
+	}
 	close(out)
 }
 
